@@ -20,9 +20,11 @@ if gpus:
             tf.config.experimental.set_memory_growth(gpu, True)
     except RuntimeError as e:
         print(e)
-from std_srvs.srv import Empty
+from std_srvs.srv import Trigger
 import random
 from collections import deque
+import csv
+import sys
 
 
 class Trainer(Node):
@@ -33,7 +35,7 @@ class Trainer(Node):
         self.declare_parameter('control_frequency', 10) 
         self.declare_parameter('collision_tol', 0.3)  # 15-25 cm
         self.declare_parameter('linear_velocity',0.2) # define constant linear speed
-        self.declare_parameter('num_lidar_ranges',20)
+        self.declare_parameter('num_lidar_ranges',50)
 
         self.control_freq = self.get_parameter('control_frequency').value
         self.collision_tol = self.get_parameter('collision_tol').value
@@ -72,7 +74,7 @@ class Trainer(Node):
         )
 
         # Clients
-        self.reset_client = self.create_client(Empty, '/reset_world') #client to reset the robot
+        self.reset_client = self.create_client(Trigger, '/randomize_robot_pose')
 
         # Timer for the control loop
         self.timer = self.create_timer(1/self.control_freq, self.control_loop_callback)
@@ -91,12 +93,19 @@ class Trainer(Node):
         self.previous_state = None
         self.previous_action = None
         self.is_resetting = False
+        self.skip_lidar_scans = 0
 
         # initialize Neural network
         self.memory = deque(maxlen=100000)
         self.model = self.build_model()
         self.target_model = self.build_model()
         self.update_target_model() #at first the two networks has to be the same
+        
+        # CSV Logging
+        self.csv_file = open('/home/seba/ros_ws/models/training_log.csv', mode='w', newline='')
+        self.csv_writer = csv.writer(self.csv_file)
+        self.csv_writer.writerow(['Episode', 'Total_Reward', 'Avg_Q_Value', 'Steps'])
+        self.episode_q_values = []
         
         self.get_logger().info('Controller inizializzato')
 
@@ -150,6 +159,10 @@ class Trainer(Node):
     
     def scan_callback(self, msg: Float32MultiArray):
         """Callback for LiDAR readings"""
+        if self.skip_lidar_scans > 0:
+            self.skip_lidar_scans -= 1
+            return
+            
         self.state = np.array(msg.data)
         self.state = self.state.reshape(1, len(self.state))
     
@@ -180,26 +193,60 @@ class Trainer(Node):
         Resets the robot to inizial state in Gazebo environment
         """
         if not self.reset_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().info("Waitning for service /reset_world")
+            self.get_logger().info("In attesa del servizio /randomize_robot_pose")
+            self.is_resetting = False
             return
 
-        request = Empty.Request()
+        request = Trigger.Request()
         future = self.reset_client.call_async(request)      # sends request to reset the robot
         future.add_done_callback(self.reset_done_callback)    # after that execute the reset_done_callback function
 
-    # def reset_simulation(self):
-    #     '''
-    #     Resets the robot in Gazebo environment, with random pose and orientation
-    #     '''
+        # Log the finished episode stats before resetting
+        avg_q = float(np.mean(self.episode_q_values)) if self.episode_q_values else 0.0
+        self.csv_writer.writerow([self.epoch_count, self.episode_reward, avg_q, self.step_count])
+        self.csv_file.flush()
+        self.episode_q_values = []
 
+        self.previous_state = None  # clear previous state
+        self.previous_action = None # clear previous action
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.beta   # update epsiolon with beta factor
+        self.epoch_count += 1
+        self.episode_reward = 0.0   # reset reward for the new episode
+
+        self.train_model()  # train the model at each epoch
+
+        if self.epoch_count == 3000:
+            self.model.save('/home/seba/ros_ws/models/trained_model_FINAL.h5')
+            self.get_logger().info('Raggiunti 3000 episodi. Salvataggio FINAL model e chiusura totale.')
+            os.system('killall -9 gzserver gzclient > /dev/null 2>&1')
+            os.system('killall -9 filter_lidar spawn_entity.py respawner > /dev/null 2>&1')
+            sys.exit(0)
+
+        if self.epoch_count % 50 == 0:  # save the model every 50 epoch
+            self.model.save('/home/seba/ros_ws/models/trained_model.h5')
+            self.get_logger().info('Model saved!')
 
     def reset_done_callback(self, future):
+        # try:
+        #     future.result()
+        #     self.get_logger().info('Reset succeded!')
+        #     self.stop_flag = False
+        #     self.step_count = 0
+        #     self.is_resetting = False
+
         try:
-            future.result()
-            self.get_logger().info('Reset succeded!')
-            self.stop_flag = False
-            self.step_count = 0
-            self.is_resetting = False
+            response = future.result()
+            if response.success:
+                self.get_logger().info(f'Reset succeded! {response.message}')
+                self.stop_flag = False
+                self.step_count = 0
+                self.state = None  
+                self.skip_lidar_scans = 3  # Ignore next 3 scans to let physics and buffers settle
+                self.is_resetting = False
+            else:
+                self.get_logger().error(f'Reset failed: {response.message}')
+                self.is_resetting = False
         
         except Exception as e:
             self.get_logger().error(f'Impossible to reset the robot: {e}')
@@ -215,7 +262,7 @@ class Trainer(Node):
         if self.state is None or not self.navigation_active or self.is_resetting:
             return
 
-        # 1. Check for collision
+        # 1. Check for collision and assign reward for this step
         if self.check_collision(self.state) or self.stop_flag:
             reward = -1000
             collision = True
@@ -224,59 +271,48 @@ class Trainer(Node):
             collision = False
         self.episode_reward += reward
 
+        # 2. Add to the memory this iteration step
         if self.previous_state is not None and self.previous_action is not None:
             self.memory.append((self.previous_state, self.previous_action, reward, self.state, collision))
 
-        # 5. Verify timeout
+        # 3. Reset robot if collision or timeout achieved 
         if self.step_count > 300 or collision:
-            self.stop_robot()
+            self.stop_robot()  # assign to the robot 0 linear and angular speed 
             self.is_resetting = True
             err = 'COLLISION' if collision else 'TIMEOUT'
-            self.get_logger().error(f'Task failer: {err}. Resetting the robot...')
-            self.reset_simulation()
-            self.previous_state = None
-            self.previous_action = None
-            if self.epsilon > self.epsilon_min:
-                self.epsilon *= self.beta
-            self.epoch_count += 1
-            if self.epoch_count % 20 == 0:
-                self.model.save('/home/seba/ros_ws/models/trained_model.h5')
-                self.get_logger().info('Model saved!')
-            self.get_logger().info(f'Episodio {self.epoch_count} concluso. Reward Totale: {self.episode_reward}')
-            self.episode_reward = 0.0
-            self.train_model()
+            self.get_logger().error(f'Episode {self.epoch_count} finished: {err}. Total reward: {self.episode_reward} Resetting the robot...')
+            
+            self.reset_simulation() # resets the robot pose
             return
 
+        # 4. Select action of the robot
+        q_values = self.model.predict(self.state, verbose=0)
+        self.episode_q_values.append(float(np.max(q_values[0])))
 
-        if random.random() < self.epsilon:
-            m = random.randint(0, self.action_size -1)
+        if random.random() < self.epsilon:  
+            m = random.randint(0, self.action_size -1) # choose a random action with probability epsilon
+            self.previous_state = self.state.copy()
         else:
-            q_values = self.model.predict(self.state, verbose=0)
-            m = np.argmax(q_values[0])
-
-        # 4. Calcola la velocità angolare in base all'equazione del paper 
-        omega_m = -0.8 + 0.16 * m
+            m = int(np.argmax(q_values[0]))
+            self.previous_state = self.state.copy()
+        omega_m = -0.8 + 0.16 * m   # find angular velocity of the robot
         
-        # 7. CMD VEL PUBBLICATION
+        # 5. Publish action
         cmd_msg = Twist()
         cmd_msg.linear.x = self.linear_velocity
         cmd_msg.angular.z = float(omega_m)
         self.cmd_vel_publisher.publish(cmd_msg)
 
-        self.previous_state = self.state.copy()
+        # 6. Train the model
         self.previous_action = m
-        
-        # 8. Periodic feedback
-        if self.step_count % self.feedback_rate == 0:
-            self.get_logger().info(
-                f'Step {self.step_count}'
-            )
         self.train_model()
 
+        # 7. Update the neural network
         if self.total_step_count % self.target_update_freq == 0:
             self.target_model.set_weights(self.model.get_weights())
             self.get_logger().info('Target Network Updated!')
 
+        # 8. Keep track of number of steps
         self.step_count += 1
         self.total_step_count += 1
     

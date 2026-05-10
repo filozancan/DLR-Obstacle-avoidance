@@ -15,8 +15,8 @@ class lidar_filter(Node):
         super().__init__("lidar_filter")
         self.publisher_scans = self.create_publisher(Float32MultiArray, '/lidar_data', 10)        
 
-        self.declare_parameter('lidar_max_range', 3.5)
-        self.declare_parameter('num_lidar_ranges', 20)
+        self.declare_parameter('lidar_max_range', 5.0)
+        self.declare_parameter('num_lidar_ranges', 50)
 
         self.lidar_max_range = self.get_parameter('lidar_max_range').value
         self.num_lidar_ranges = self.get_parameter('num_lidar_ranges').value

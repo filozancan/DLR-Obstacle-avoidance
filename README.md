@@ -19,7 +19,7 @@ source ~/ros_ws/install/setup.bash
 
 # 2) Install the requirements (be sure to be in virtual environment):
 
-pip install -r requirements.txt
+pip install -r requirements_essential.txt
 
 # 3) Add in .venv/bin/activate file these lines
 
